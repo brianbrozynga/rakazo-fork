@@ -88,6 +88,7 @@ import {
   Copy,
   Gauge,
   LayoutGrid,
+  KeyRound,
   Lock,
   LogOut,
   Maximize2,
@@ -175,6 +176,7 @@ import {
 import { markAfterPaint, markOnce } from "../lib/performance";
 import { quoteDraftForSelection } from "../lib/quote-selection";
 import { clearSpaceSelection, rpc, selectedSpaceId, selectSpace } from "../lib/rpc";
+import { useModelOAuthSignIn } from "../lib/use-model-oauth-signin";
 import { readSeenRunErrorIds, rememberSeenRunErrorId } from "../lib/run-error-storage";
 import { sharedInflight } from "../lib/shared-inflight";
 import {
@@ -363,6 +365,17 @@ export function ShellPage() {
   const [replyQuote, setReplyQuote] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const pendingSageResendRef = useRef<(() => void) | null>(null);
+  const { startSubscriptionSignIn, oauthPending: sageOAuthPending } = useModelOAuthSignIn({
+    onFinished: () => {
+      setSendError(null);
+      const resend = pendingSageResendRef.current;
+      pendingSageResendRef.current = null;
+      if (resend) void Promise.resolve().then(resend);
+    },
+    onError: (message) => setSendError(message),
+    onClearError: () => setSendError(null),
+  });
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [panel, setPanel] = useState<Panel>(null);
@@ -535,6 +548,7 @@ export function ShellPage() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [initialBotsLoaded, setInitialBotsLoaded] = useState(false);
   const [bootstrapMe, setBootstrapMe] = useState<Me | null>();
+  const [bootstrapRequiresSageAuth, setBootstrapRequiresSageAuth] = useState(false);
   const [routineDraft, setRoutineDraft] = useState<RoutineDraftState>(emptyRoutineDraft());
   const [routineWebhookSecret, setRoutineWebhookSecret] = useState<string | null>(null);
   const [editingRoutine, setEditingRoutine] = useState<Routine | null>(null);
@@ -1017,6 +1031,7 @@ export function ShellPage() {
         if (cancelled) return;
         const groupList = bootstrap.groups;
         setBootstrapMe(bootstrap.me);
+        if (bootstrap.requiresSageAuth) setBootstrapRequiresSageAuth(true);
         // Skip list/route writes only if a later refreshBots() successfully
         // committed (failed refreshes bump epoch but not botsRefreshApplied).
         const applyBotLists = appliedAtStart === botsRefreshApplied.current;
@@ -1087,6 +1102,21 @@ export function ShellPage() {
       document.removeEventListener("visibilitychange", refreshVisibleBots);
     };
   }, []);
+
+  // Proactive Sage auth: when the credential is in unauthenticated state (apiKey === "sage"),
+  // redirect to Sage Auth immediately so the first model call works without requiring a failed
+  // message first. Full-page redirect avoids popup-blocker restrictions.
+  const sageAutoRedirectRef = useRef(false);
+  const startSubscriptionSignInRef = useRef(startSubscriptionSignIn);
+  startSubscriptionSignInRef.current = startSubscriptionSignIn;
+  useEffect(() => {
+    if (!bootstrapRequiresSageAuth || sageAutoRedirectRef.current) return;
+    // Suppress if we just came from a redirect (loop guard: 30-second window).
+    const startedAt = sessionStorage.getItem("sage_oauth_started_at");
+    if (startedAt && Date.now() - Number(startedAt) < 30_000) return;
+    sageAutoRedirectRef.current = true;
+    void startSubscriptionSignInRef.current({ provider: "sage-prod", mode: "pkce" });
+  }, [bootstrapRequiresSageAuth]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1682,6 +1712,7 @@ export function ShellPage() {
   const handleRunErrorPresented = useCallback((runId: string) => {
     rememberSeenRunErrorId(runId);
   }, []);
+
   const transcriptMessages = useMemo(
     () => userVisibleMessages(activeSnapshot?.messages ?? [], { includePeerReceipts: true }),
     [activeSnapshot?.messages],
@@ -2076,6 +2107,9 @@ export function ShellPage() {
           navigate(`/app/g/${groupTarget}`);
           return;
         }
+        // Register resend closure so Sage JWT auto-retry (onFinished) can replay this message
+        // if the run fails with "Sage JWT required" and PKCE fires reactively.
+        pendingSageResendRef.current = () => void sendMessage(text, mentions);
         if (groupTarget && activeGroupId.current === groupTarget) setAttachmentNotice(null);
         if (botTarget && activeBotId.current === botTarget) setAttachmentNotice(null);
         if (groupTarget) await refreshGroupThreadRef.current(groupTarget);
@@ -3168,6 +3202,19 @@ export function ShellPage() {
                 <LogOut className="text-muted-foreground" strokeWidth={1.75} />
                 <Trans>Log out</Trans>
               </Button>
+              {bootstrapRequiresSageAuth === false ? (
+                <Button
+                  variant="ghost"
+                  className="w-full justify-start font-normal"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    void rpc.models.resetSageJwt().then(() => window.location.reload());
+                  }}
+                >
+                  <KeyRound className="text-muted-foreground" strokeWidth={1.75} />
+                  Sign out of Sage
+                </Button>
+              ) : null}
             </PopoverContent>
           ) : null}
         </Popover>
@@ -3357,6 +3404,13 @@ export function ShellPage() {
             runErrorId={displayedRunErrorId}
             onRunErrorPresented={handleRunErrorPresented}
             onDismissError={dismissComposerError}
+            onSageSignIn={
+              (displayedRunError?.includes("Sage JWT required") ||
+                sendError?.includes("Sage JWT required")) &&
+              !sageOAuthPending
+                ? () => void startSubscriptionSignIn({ provider: "sage-prod", mode: "pkce" })
+                : undefined
+            }
             sending={sending}
             fileInputRef={fileInputRef}
             onAttachmentPick={onAttachmentPick}
@@ -4831,6 +4885,7 @@ const Composer = memo(function Composer({
   runErrorId,
   onRunErrorPresented,
   onDismissError,
+  onSageSignIn,
   sending,
   fileInputRef,
   onAttachmentPick,
@@ -4857,6 +4912,7 @@ const Composer = memo(function Composer({
   runErrorId: string | null;
   onRunErrorPresented: (runId: string) => void;
   onDismissError: () => void;
+  onSageSignIn?: () => void;
   sending: boolean;
   fileInputRef: RefObject<HTMLInputElement | null>;
   onAttachmentPick: (files: FileList | null) => void | Promise<void>;
@@ -5146,6 +5202,15 @@ const Composer = memo(function Composer({
           className="mb-3 flex items-center gap-2 rounded-[14px] border border-destructive/40 bg-destructive/10 px-4 py-2 text-[13px] text-destructive"
         >
           <span className="min-w-0 flex-1">{sendError ?? runError}</span>
+          {onSageSignIn ? (
+            <button
+              type="button"
+              onClick={onSageSignIn}
+              className="shrink-0 rounded px-2 py-0.5 text-[12px] font-medium text-destructive underline hover:text-foreground"
+            >
+              Sign in with Sage
+            </button>
+          ) : null}
           <button
             type="button"
             aria-label={t`Dismiss error`}

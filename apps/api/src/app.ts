@@ -63,7 +63,9 @@ import {
   SpaceMemoryProviderResolver,
   toTeamChatInbound,
 } from "@rakazo/adapters";
+import { SageAgentRuntime, SageOAuthLogins } from "@rakazo/sage-provider";
 import { blockedAuthPaths, createAuth } from "@rakazo/auth";
+import { SageRuntimeBridge } from "./sage-runtime-bridge.js";
 import { signupPolicyFromEnv } from "@rakazo/core";
 import type { Pool, PrismaClient } from "@rakazo/db";
 import {
@@ -234,6 +236,7 @@ export async function createApp(
   const mcpOAuth = new McpOAuthBroker(prisma, secrets, remoteConnectors);
   const memoryProviders = new SpaceMemoryProviderResolver(prisma, secrets);
   const oauthLogins = new PiOAuthLogins();
+  const sageOAuthLogins = new SageOAuthLogins();
   const home = new LocalAgentHomeStore(env.dataDir);
   const artifacts = new LocalArtifactStore(env.dataDir);
   const memory = new MarkdownMemoryStore(prisma);
@@ -300,12 +303,14 @@ export async function createApp(
   const connector = stack.destination;
   await connector.start();
   integrationSettings.warmDirectories();
-  const runtime =
+  const piRuntime =
     env.agentRuntime === "scripted"
       ? new ScriptedAgentRuntime()
       : new PiAgentRuntime({
           sessionRoot: env.piSessionRecording ? piSessionsRoot(env.dataDir) : undefined,
         });
+  const sageAgentRuntime = new SageAgentRuntime();
+  const runtime = new SageRuntimeBridge(piRuntime, sageAgentRuntime);
   const notifications = new ExpoPushProvider(env.dataDir);
   const auth = createAuth(prisma, {
     secret: env.authSecret,
@@ -437,6 +442,7 @@ export async function createApp(
     home,
     secrets,
     oauthLogins,
+    sageOAuthLogins,
     integrationSettings,
     mcpOAuth,
     composio: stack.composio,
@@ -465,6 +471,7 @@ export async function createApp(
       updaterToken: env.updaterToken,
       imageTag: env.imageTag,
       integrationsCatalogUrl: env.integrationsCatalogUrl,
+      apiUrl: env.apiUrl,
     },
   });
   const rpc = new RPCHandler(router, {
@@ -498,6 +505,31 @@ export async function createApp(
     );
   }
   mountApiRequestBodyLimits(app);
+
+  // Unauthenticated — frontend SageOAuthCallbackPage posts here after receiving
+  // the redirect at http://localhost:5173/callback. State token is the CSRF guard.
+  app.post("/api/sage/oauth/receive", async (c) => {
+    let code: string | undefined;
+    let state: string | undefined;
+    try {
+      const body = await c.req.json<{ code?: unknown; state?: unknown }>();
+      code = typeof body.code === "string" ? body.code : undefined;
+      state = typeof body.state === "string" ? body.state : undefined;
+    } catch {
+      return c.json({ error: "Invalid request body" }, 400);
+    }
+    if (!code || !state) {
+      return c.json({ error: "Missing code or state" }, 400);
+    }
+    try {
+      await sageOAuthLogins.receiveCallback(code, state);
+      return c.json({ ok: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Authentication failed";
+      return c.json({ error: message }, 400);
+    }
+  });
+
   mountScreenTarget(app, prisma, env.screenProxySecret);
   app.on(["GET", "POST"], "/api/auth/*", async (c) => {
     const path = new URL(c.req.url).pathname.replace("/api/auth", "");
@@ -835,6 +867,7 @@ export async function createApp(
       // on waitForComputerReady for the full boot-wait window during shared Postgres journeys.
       shutdown.abort();
       oauthLogins.abortAll();
+      sageOAuthLogins.abortAll();
       messagingStopped = true;
       clearMessagingRetryDelay?.();
       clearTeamChatRetryDelay?.();

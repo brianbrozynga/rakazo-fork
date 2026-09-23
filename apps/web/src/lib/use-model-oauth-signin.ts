@@ -9,6 +9,7 @@ export type ModelOAuthSignInBegin = {
   provider: string;
   modelId?: string;
   label?: string;
+  mode?: "pkce";
 };
 
 /**
@@ -129,6 +130,7 @@ export function useModelOAuthSignIn(options: {
           provider: begin.provider,
           modelId: begin.modelId,
           label: begin.label,
+          mode: begin.mode,
         },
         { signal: controller.signal },
       );
@@ -136,6 +138,8 @@ export function useModelOAuthSignIn(options: {
       oauthLoginIdRef.current = started.loginId;
       setPasteCode("");
       setOauth(started);
+      // For auth-url mode: subscribe desktop callback for loopback capture.
+      // For pkce mode: no desktop callback needed; the /callback route handles the redirect.
       if (started.mode === "auth-url") {
         // Subscribe before the popup exists: a provider that is already
         // authorized can redirect before React commits the state above.
@@ -145,10 +149,11 @@ export function useModelOAuthSignIn(options: {
           oauthStateOf(started.verificationUri),
         );
       }
+      const openUrl = started.mode === "pkce" ? started.authUrl : started.verificationUri;
       const browserAuth = desktopBridge()?.oauth;
       if (browserAuth?.open) {
         const cancelBrowser = () =>
-          void browserAuth.cancel?.(started.verificationUri).catch(() => undefined);
+          void browserAuth.cancel?.(openUrl).catch(() => undefined);
         controller.signal.addEventListener("abort", cancelBrowser, { once: true });
         const releaseCapture = oauthCaptureRef.current;
         oauthCaptureRef.current = () => {
@@ -156,10 +161,19 @@ export function useModelOAuthSignIn(options: {
           controller.signal.removeEventListener("abort", cancelBrowser);
           cancelBrowser();
         };
-        await browserAuth.open(started.verificationUri);
+        await browserAuth.open(openUrl);
         if (controller.signal.aborted) return;
+      } else if (started.mode === "pkce") {
+        // Full-page redirect — save state so the callback page can finishOAuth and navigate back.
+        sessionStorage.setItem("sage_oauth_login_id", started.loginId);
+        sessionStorage.setItem("sage_oauth_return_url", window.location.href);
+        sessionStorage.setItem("sage_oauth_started_at", String(Date.now()));
+        window.location.href = openUrl;
+        // Prevent finishSubscriptionSignIn — page is navigating away.
+        waitingForCode = true;
+        return;
       } else {
-        window.open(started.verificationUri, "rakazo-model-oauth", "noopener,noreferrer");
+        window.open(openUrl, "rakazo-model-oauth", "noopener,noreferrer");
       }
       waitingForCode = started.mode === "auth-url";
       if (!waitingForCode) await finishSubscriptionSignIn(started.loginId, controller);

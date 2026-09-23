@@ -210,6 +210,7 @@ export const appContract = {
           provider: z.string(),
           label: z.string().optional(),
           modelId: z.string().optional(),
+          mode: z.literal("pkce").optional(),
         }),
       )
       .output(ModelOAuthBeginSchema),
@@ -229,6 +230,7 @@ export const appContract = {
     cancelOAuth: oc
       .input(z.object({ loginId: z.string() }))
       .output(z.object({ ok: z.literal(true) })),
+    resetSageJwt: oc.output(z.object({ ok: z.literal(true) })),
     setDefault: oc
       .input(z.object({ provider: z.string(), modelId: z.string() }))
       .output(z.object({ ok: z.literal(true) })),

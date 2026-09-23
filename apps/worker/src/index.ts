@@ -26,6 +26,8 @@ import {
   isComposioEnabled,
   isMessagingSurfaceEnabled,
   isPipedreamEnabled,
+  BrokerSandboxProvider,
+  listenBotHomeMcp,
   LocalAgentHomeStore,
   LocalArtifactStore,
   McpConnector,
@@ -45,6 +47,7 @@ import {
   SpaceMemoryProviderResolver,
 } from "@rakazo/adapters";
 import { resolveEncryptionKey, resolveSupervisorToken } from "@rakazo/core";
+import { SageAgentRuntime, SageRuntimeBridge } from "@rakazo/sage-provider";
 import {
   createDb,
   createThreadEvents,
@@ -78,10 +81,11 @@ async function main() {
     runSecretWriter: createRunSecretWriter(secrets),
   });
   const dataDir = process.env.DATA_DIR ?? "./data";
+  const piRuntime = new PiAgentRuntime({ sessionRoot: resolvePiSessionRoot(dataDir) });
   const runtime =
     process.env.AGENT_RUNTIME === "scripted"
       ? new ScriptedAgentRuntime()
-      : new PiAgentRuntime({ sessionRoot: resolvePiSessionRoot(dataDir) });
+      : new SageRuntimeBridge(piRuntime, new SageAgentRuntime());
   // Same resolver the API uses, so both processes agree on provider, model and key.
   const { key: deploymentModelKey } = resolveDeploymentModel();
   const sandboxProvider = resolveSandboxProvider(process.env);
@@ -245,11 +249,33 @@ async function main() {
   });
   reconciler.start();
 
+  const botHomePort = Number(process.env.RAKAZO_BOT_HOME_LISTEN_PORT ?? 0);
+  const brokerSandboxUrl = process.env.RAKAZO_BROKER_SANDBOX_MCP_URL ?? "";
+  const brokerSandbox = brokerSandboxUrl
+    ? new BrokerSandboxProvider(brokerSandboxUrl, process.env.RAKAZO_BROKER_MCP_KEY ?? "")
+    : undefined;
+  const botHome =
+    Number.isFinite(botHomePort) && botHomePort > 0
+      ? await listenBotHomeMcp({
+          port: botHomePort,
+          authKey: process.env.RAKAZO_BOT_HOME_MCP_KEY ?? "",
+          sandbox: brokerSandbox ?? sandbox,
+          localSandbox: brokerSandbox ? sandbox : undefined,
+          prisma,
+          artifacts,
+          events,
+        }).then((handle) => {
+          logger.info(`bot-home MCP listening on :${botHomePort}`);
+          return handle;
+        })
+      : undefined;
+
   let stopping = false;
   const stop = async () => {
     if (stopping) return;
     stopping = true;
     try {
+      await botHome?.close().catch(() => undefined);
       await reconciler.stop();
       await jobHost.stop();
       await jobs.close();

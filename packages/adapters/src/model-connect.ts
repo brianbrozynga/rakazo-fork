@@ -127,5 +127,6 @@ export function modelCredentialDto(
       openAiCompatibleModel(row.defaultModel ?? "custom", parsed.baseUrl, parsed.reasoning),
     ) as ThinkingLevel[],
     modelId: row.defaultModel ?? undefined,
+    ...(parsed.apiKey === "sage" ? { requiresSageAuth: true } : {}),
   };
 }

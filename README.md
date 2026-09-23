@@ -193,6 +193,50 @@ pnpm test:e2e
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development workflow and test matrix.
 
+## Zynga fork — Sage AI integration
+
+This fork adds Sage AI as a model provider, available in three environments (dev, stg, prod). Users authenticate via Zynga PKCE OAuth; no separate credential entry is required. Sage models appear alongside Pi models in the bot creation flow.
+
+### Package layout
+
+- **`packages/sage-provider`** — adapter wrapping the Sage TypeScript SDK. Exports `SageOAuthLogins` (PKCE auth state machine), `SageAgentRuntime` (ACP WebSocket chat), `SageModelProvider` (REST model list), and the provider ID constants.
+- **`apps/api/src/sage-catalog.ts`** — static placeholder catalog entries, one per environment.
+- **`apps/api/src/sage-runtime-bridge.ts`** — dispatches `AgentRuntime.run()` to Sage or Pi based on the model's provider ID.
+
+### Prerequisites
+
+`packages/sage-provider` depends on `sage-sdk` via a `file:` path pointing at a sibling `sage-sdk-typescript` directory (one level above the repo root). pnpm copies the package's `dist/` directory at install time, so **the SDK must be built before `pnpm install`**.
+
+```shell
+cd ../sage-sdk-typescript
+npm run build
+```
+
+The browser bundle target will fail; the Node CJS, ESM, and declaration outputs succeed. Only the Node outputs are consumed by `packages/sage-provider`, so the browser failure is safe to ignore.
+
+### Install
+
+The repo's `engines` field requires Node 22.22.2+, 24.x, or 26+. If your Node version is older within the 22.x line, pass `--config.engine-strict=false`:
+
+```shell
+pnpm install --config.engine-strict=false
+```
+
+After the first install, re-run the same command whenever you rebuild the SDK to pick up updated `dist/` files (pnpm will refresh the copied package).
+
+### Environment variables
+
+Sage OAuth requires the following `.env` entries (values supplied separately):
+
+```ini
+SAGE_DEV_BASE_URL=
+SAGE_STG_BASE_URL=
+SAGE_PROD_BASE_URL=
+SAGE_DEV_CLIENT_ID=
+SAGE_STG_CLIENT_ID=
+SAGE_PROD_CLIENT_ID=
+```
+
 ## Documentation
 
 - [Self-hosting](./docs/self-host.md)

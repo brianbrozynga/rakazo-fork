@@ -41,20 +41,16 @@ import {
   registerOpenAiCompatibleCatalog,
   registerOpenAiCompatibleRuntime,
 } from "./pi-openai-compatible-provider.js";
-import {
-  billedPromptTokens,
-  clipToolResultContent,
-  clipToolResultText,
-  MODEL_STREAM_MAX_RETRIES,
-  MODEL_STREAM_TIMEOUT_MS,
-  resolveCompletionMaxTokens,
-} from "./pi-runtime-limits.js";
+import { billedPromptTokens, clipToolResultContent, clipToolResultText, MODEL_STREAM_MAX_RETRIES, MODEL_STREAM_TIMEOUT_MS, resolveCompletionMaxTokens } from "./pi-runtime-limits.js";
+import { callBrokerSubagent } from "./broker-subagent.js";
 import {
   PiJsonlSessionRecorder,
   type PiSessionHandle,
   type PiSessionRecorder,
 } from "./pi-session.js";
 import { textContentArg } from "./tool-text.js";
+import { dispatcherFetch } from "./undici-fetch.js";
+import { switchboardSink, tapSwitchboardResponse, type SwitchboardIds } from "./switchboard-ids.js";
 
 const running = new Map<string, { controller: AbortController; work: Promise<void> }>();
 interface ToolCallBudget {
@@ -258,7 +254,19 @@ export class PiAgentRuntime implements AgentRuntime {
           sessionId: conversationSessionId(request.threadId, request.botId),
           steeringMode: "all",
           streamFn: (m, ctx, options) =>
-            models.streamSimple(m, ctx, reliableStreamOptions(m, options, request.model.maxTokens)),
+            models.streamSimple(
+              m,
+              ctx,
+              withSwitchboardRunCapture(
+                m,
+                withSwitchboardChatId(
+                  m,
+                  reliableStreamOptions(m, options, request.model.maxTokens),
+                  request.threadId,
+                ),
+                switchboardSink(request),
+              ),
+            ),
           getApiKey: async () => apiKey,
           transformContext: async (messages) =>
             pruneComputerScreenshotContext(
@@ -301,6 +309,8 @@ export class PiAgentRuntime implements AgentRuntime {
         signal.addEventListener("abort", onAbort);
 
         let streamed = "";
+        let bannerParsed = false;
+        let bannerBuffer = "";
         let toolCalls = 0;
         let toolActivityShowing = false;
         let silentToolContinuations = 0;
@@ -325,15 +335,35 @@ export class PiAgentRuntime implements AgentRuntime {
             event.type === "message_update" &&
             event.assistantMessageEvent.type === "text_delta"
           ) {
-            const delta = event.assistantMessageEvent.delta;
-            if (delta) {
-              if (toolActivityShowing) {
-                // Real text replaces the activity line instead of appending to it.
-                toolActivityShowing = false;
-                queue.push({ type: "progress", text: "", activity: true });
+            const rawDelta = event.assistantMessageEvent.delta;
+            if (rawDelta) {
+              // Strip [switchboard] routing notice banner from the leading text of each
+              // assistant message. The broker prepends these diagnostic lines followed
+              // by a blank line; buffer deltas until we see "\n\n", then decide.
+              let delta: string | undefined = rawDelta;
+              if (!bannerParsed) {
+                bannerBuffer += rawDelta;
+                const sep = bannerBuffer.indexOf("\n\n");
+                if (sep === -1) {
+                  delta = undefined; // Still accumulating banner header; nothing to emit yet
+                } else {
+                  bannerParsed = true;
+                  const stripped = bannerBuffer.trimStart().startsWith("[switchboard]")
+                    ? bannerBuffer.slice(sep + 2) // drop banner lines + blank line
+                    : bannerBuffer;               // no banner; emit everything buffered
+                  bannerBuffer = "";
+                  delta = stripped || undefined;
+                }
               }
-              streamed += delta;
-              queue.push({ type: "text", text: delta });
+              if (delta) {
+                if (toolActivityShowing) {
+                  // Real text replaces the activity line instead of appending to it.
+                  toolActivityShowing = false;
+                  queue.push({ type: "progress", text: "", activity: true });
+                }
+                streamed += delta;
+                queue.push({ type: "text", text: delta });
+              }
             }
           }
           if (event.type === "turn_end") {
@@ -367,6 +397,9 @@ export class PiAgentRuntime implements AgentRuntime {
             }
           }
           if (event.type === "message_end" && event.message.role === "assistant") {
+            // Reset banner state so the next assistant turn gets stripped independently.
+            bannerParsed = false;
+            bannerBuffer = "";
             const text = assistantText(event.message);
             if (text && !streamed) {
               streamed = text;
@@ -938,7 +971,26 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
             };
           }
           if (tool.name === "run_subagent") {
-            const result = await executeSubagent(host, executionId, args);
+            const brokerMcpUrl = process.env.RAKAZO_BROKER_HELPER_MCP_URL;
+            const brokerMcpKey = process.env.RAKAZO_BROKER_MCP_KEY;
+            const brokerMcpTool = process.env.RAKAZO_BROKER_HELPER_MCP_TOOL;
+            const result =
+              brokerMcpUrl && brokerMcpKey && brokerMcpTool
+                ? await callBrokerSubagent(
+                    host,
+                    executionId,
+                    args,
+                    brokerMcpUrl,
+                    brokerMcpKey,
+                    brokerMcpTool,
+                    {
+                      botId: host.request.botId,
+                      runId: host.request.runId,
+                      threadId: host.request.threadId,
+                    },
+                    host.request.switchboard,
+                  )
+                : await executeSubagent(host, executionId, args);
             return {
               content: [{ type: "text", text: result }],
               details: { result },
@@ -1050,7 +1102,15 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
       selectedModel.models.streamSimple(
         m,
         ctx,
-        reliableStreamOptions(m, options, requestModel.maxTokens),
+        withSwitchboardRunCapture(
+          m,
+          withSwitchboardChatId(
+            m,
+            reliableStreamOptions(m, options, requestModel.maxTokens),
+            host.request.threadId,
+          ),
+          switchboardSink(host.request),
+        ),
       ),
     getApiKey: async () => selectedModel.apiKey,
     transformContext: async (messages) =>
@@ -1603,7 +1663,43 @@ export function isOpenCodeProvider(provider: string): boolean {
   return provider === "opencode" || provider === "opencode-go";
 }
 
+export function withSwitchboardChatId(
+  model: Pick<Model<Api>, "provider">,
+  options: SimpleStreamOptions,
+  threadId: string,
+): SimpleStreamOptions {
+  if (model.provider !== OPENAI_COMPATIBLE_PROVIDER_ID) return options;
+  const id = threadId.trim();
+  if (!id) return options;
+  return {
+    ...options,
+    headers: { ...options.headers, "x-switchboard-chat-id": id },
+  };
+}
+
+export function withSwitchboardRunCapture(
+  model: Pick<Model<Api>, "provider">,
+  options: SimpleStreamOptions,
+  sink: SwitchboardIds,
+): SimpleStreamOptions {
+  if (model.provider !== OPENAI_COMPATIBLE_PROVIDER_ID) return options;
+  const current = options as SimpleStreamOptions & { fetch?: typeof fetch };
+  const inner = current.fetch ?? dispatcherFetch;
+  return {
+    ...options,
+    fetch: async (input, init) => {
+      const response = await inner(input, init);
+      const ctype = response.headers.get("content-type") ?? "";
+      if (ctype.includes("text/event-stream") || ctype.includes("json")) {
+        void tapSwitchboardResponse(response.clone(), sink).catch(() => undefined);
+      }
+      return response;
+    },
+  } as SimpleStreamOptions;
+}
+
 const OPENCODE_SESSION_ERROR = "OpenCode rejected this chat session. Send the message again.";
+export const SAGE_JWT_REQUIRED_ERROR = "Sage JWT required";
 
 function looksLikeOpenCodeSessionError(message: string): boolean {
   return (
@@ -1617,6 +1713,9 @@ function sanitizeProviderError(provider: string, message: string): string {
   const sanitized = sanitizeError(message);
   if (isOpenCodeProvider(provider) && looksLikeOpenCodeSessionError(sanitized)) {
     return OPENCODE_SESSION_ERROR;
+  }
+  if (provider === "openai-compatible" && /sage jwt required/i.test(sanitized)) {
+    return SAGE_JWT_REQUIRED_ERROR;
   }
   return sanitized;
 }

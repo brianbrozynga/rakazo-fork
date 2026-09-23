@@ -597,7 +597,7 @@ export function OnboardingPage() {
                           <Trans>Waiting for sign-in…</Trans>
                         </p>
                       </>
-                    ) : (
+                    ) : oauth.mode === "device-code" ? (
                       <>
                         <p className="text-sm text-muted-foreground">
                           <Trans>
@@ -619,6 +619,10 @@ export function OnboardingPage() {
                           <Trans>Waiting for sign-in…</Trans>
                         </p>
                       </>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        <Trans>Waiting for sign-in…</Trans>
+                      </p>
                     )}
                   </div>
                 ) : (

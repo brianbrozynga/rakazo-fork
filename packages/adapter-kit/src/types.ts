@@ -7,6 +7,9 @@ export interface AdapterContext {
   userId: string;
   botId?: string;
   runId?: string;
+  /** Broker protocol run_id from chat SSE. Never Rakazo's prisma run UUID. */
+  switchboardRunId?: string;
+  switchboardJobId?: string;
   /** Opaque fence for releasing a graphical screen without tearing down its replacement. */
   screenLeaseId?: string;
   /** When releasing a screen after cancel, also stop orphaned browser work on that screen. */
@@ -374,6 +377,8 @@ export interface AgentRunRequest {
   botId: string;
   threadId: string;
   runId: string;
+  /** Broker protocol ids captured from chat SSE. Not this Rakazo run UUID. */
+  switchboard?: { runId?: string; jobId?: string };
   sourceMessageId?: string | null;
   prompt: string;
   instructions: string;

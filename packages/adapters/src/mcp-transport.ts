@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -69,9 +70,32 @@ export interface McpClientOptions {
   capabilities?: ConstructorParameters<typeof Client>[1];
 }
 
-const DEFAULT_HEADERS = ["accept", "content-type", "authorization", "user-agent"];
+const DEFAULT_HEADERS = [
+  "accept",
+  "content-type",
+  "authorization",
+  "user-agent",
+  "x-switchboard-run-id",
+  "x-switchboard-job-id",
+];
 const RESOURCE_HEADERS = new Set(["mcp-session-id", "mcp-protocol-version", "last-event-id"]);
 const DEFAULT_MAX_URL_LENGTH = 2_048;
+const callIdentity = new AsyncLocalStorage<Record<string, string>>();
+
+function withCallIdentityHeaders(fetchImpl: typeof fetch): typeof fetch {
+  return async (input: Request | URL | string, init?: RequestInit): Promise<Response> => {
+    const extra = callIdentity.getStore();
+    if (!extra || Object.keys(extra).length === 0) return fetchImpl(input, init);
+    if (input instanceof Request) {
+      const headers = new Headers(input.headers);
+      for (const [name, value] of Object.entries(extra)) headers.set(name, value);
+      return fetchImpl(new Request(input, { headers }));
+    }
+    const headers = new Headers(init?.headers);
+    for (const [name, value] of Object.entries(extra)) headers.set(name, value);
+    return fetchImpl(input, { ...init, headers });
+  };
+}
 
 function validateUrl(raw: string | URL, policy: McpUrlPolicy = {}): URL {
   const url = new URL(raw.toString());
@@ -271,7 +295,7 @@ export class McpSession {
       options.network,
     );
     this.remoteFetch = safeFetch;
-    const fetch = withEndpointOriginFallback(url.origin, safeFetch);
+    const fetch = withCallIdentityHeaders(withEndpointOriginFallback(url.origin, safeFetch));
     const signal = combineSignals(options.signal, AbortSignal.timeout(options.timeoutMs ?? 15_000));
     let usedFallback = false;
     const connect = async (kind: McpRemoteTransport): Promise<void> => {
@@ -355,12 +379,18 @@ export class McpSession {
   async callTool(
     name: string,
     args: Record<string, unknown> = {},
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; meta?: Record<string, unknown>; headers?: Record<string, string> },
   ): Promise<CallToolResult> {
     this.assertConnected();
-    return (await this.client.callTool({ name, arguments: args }, undefined, {
-      signal: options?.signal,
-    })) as CallToolResult;
+    const invoke = () =>
+      this.client.callTool(
+        { name, arguments: args, ...(options?.meta ? { _meta: options.meta } : {}) },
+        undefined,
+        { signal: options?.signal },
+      ) as Promise<CallToolResult>;
+    const extra = options?.headers;
+    if (!extra || Object.keys(extra).length === 0) return invoke();
+    return callIdentity.run(extra, invoke);
   }
 
   async close(): Promise<void> {

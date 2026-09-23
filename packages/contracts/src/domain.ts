@@ -930,6 +930,7 @@ export const ModelCredentialSchema = z.object({
   supportsImages: z.boolean().optional(),
   maxImagesPerPrompt: z.number().int().min(1).max(1000).optional(),
   thinkingLevels: z.array(ThinkingLevelSchema).optional(),
+  requiresSageAuth: z.boolean().optional(),
 });
 export type ModelCredential = z.infer<typeof ModelCredentialSchema>;
 
@@ -988,7 +989,7 @@ export const ModelConnectInputSchema = z
   });
 export type ModelConnectInput = z.infer<typeof ModelConnectInputSchema>;
 
-export const ModelOAuthSignInModeSchema = z.enum(["device-code", "auth-url"]);
+export const ModelOAuthSignInModeSchema = z.enum(["device-code", "auth-url", "pkce"]);
 export type ModelOAuthSignInMode = z.infer<typeof ModelOAuthSignInModeSchema>;
 
 const ModelOAuthBeginBaseSchema = z.object({
@@ -1007,6 +1008,16 @@ export const ModelOAuthBeginSchema = z.discriminatedUnion("mode", [
     userCode: z.string().min(1),
   }),
   ModelOAuthBeginBaseSchema.extend({ mode: z.literal("auth-url") }),
+  z.object({
+    loginId: z.string(),
+    provider: z.string(),
+    expiresInSeconds: z.number().int().positive(),
+    mode: z.literal("pkce"),
+    authUrl: z
+      .string()
+      .url()
+      .refine((v) => v.startsWith("https://"), "Expected an HTTPS authorization URL"),
+  }),
 ]);
 export type ModelOAuthBegin = z.infer<typeof ModelOAuthBeginSchema>;
 
@@ -1208,6 +1219,7 @@ export const AppBootstrapSchema = z.object({
   thread: ThreadSnapshotSchema.nullable(),
   routines: z.array(RoutineSchema),
   spaces: z.array(SpaceSchema),
+  requiresSageAuth: z.boolean().optional(),
 });
 export type AppBootstrap = z.infer<typeof AppBootstrapSchema>;
 

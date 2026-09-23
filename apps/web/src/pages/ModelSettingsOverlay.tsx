@@ -350,6 +350,7 @@ export function ModelSettingsOverlay({
       provider: selected.provider,
       modelId: selected.id,
       label: selected.providerName ?? selected.provider,
+      mode: selected.signIn === "pkce" ? "pkce" : undefined,
     });
   }
 
@@ -692,7 +693,7 @@ export function ModelSettingsOverlay({
                             <Trans>Waiting for sign-in…</Trans>
                           </p>
                         </>
-                      ) : (
+                      ) : oauth.mode === "device-code" ? (
                         <>
                           <p className="text-sm leading-[1.5] text-muted-foreground">
                             <Trans>
@@ -714,6 +715,10 @@ export function ModelSettingsOverlay({
                             <Trans>Waiting for sign-in…</Trans>
                           </p>
                         </>
+                      ) : (
+                        <p className="text-sm text-muted-foreground">
+                          <Trans>Waiting for sign-in…</Trans>
+                        </p>
                       )}
                     </div>
                   ) : (

@@ -1737,6 +1737,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
           return occurrence;
         };
 
+        const switchboardIds: { runId?: string; jobId?: string } = {};
         const applyTool = async (
           name: string,
           args: Record<string, unknown>,
@@ -3496,7 +3497,11 @@ export function createRunExecutor(deps: ExecutorDeps) {
             let result: unknown = { error: `unknown tool ${name}` };
             for await (const event of deps.connector.execute(
               { ...connectorCall, tool: name, args, executionId: effectKey },
-              context,
+              {
+                ...context,
+                switchboardRunId: switchboardIds.runId,
+                switchboardJobId: switchboardIds.jobId,
+              },
             )) {
               if (event.type === "result") {
                 result = event.data;
@@ -3626,6 +3631,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               botId: bot.id,
               threadId: thread.id,
               runId,
+              switchboard: switchboardIds,
               sourceMessageId: run.sourceMessageId,
               prompt,
               instructions: [

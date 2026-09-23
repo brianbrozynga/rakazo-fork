@@ -75,6 +75,7 @@ import {
   scheduleComputerSleep,
   screenLeaseIdForRun,
   scriptedCatalogEntry,
+  parseModelSecret,
   serializeModelSecret,
   takeoverLeaseMs,
   toComputerRef,
@@ -89,6 +90,12 @@ import {
   OPENAI_COMPATIBLE_PROVIDER_ID,
   usableModelId,
 } from "@rakazo/contracts";
+import {
+  SAGE_PROVIDER_IDS,
+  SageOAuthLogins,
+  SAGE_PROVIDER_NAMES,
+} from "@rakazo/sage-provider";
+import { listSageCatalog } from "./sage-catalog.js";
 import {
   ACTIVE_RUN_STATUSES,
   AttachmentValidationError,
@@ -430,6 +437,7 @@ export interface RouterDeps {
   home: AgentHomeStore;
   secrets: EncryptedSecretStore;
   oauthLogins: PiOAuthLogins;
+  sageOAuthLogins: SageOAuthLogins;
   integrationSettings?: IntegrationProviderSettings;
   composio?: ComposioProvider;
   mcpOAuth?: McpOAuthBroker;
@@ -455,6 +463,7 @@ export interface RouterDeps {
     updaterToken?: string;
     imageTag?: string;
     integrationsCatalogUrl?: string;
+    apiUrl: string;
   };
 }
 
@@ -479,6 +488,8 @@ function mapSpaceLifecycleError(error: unknown): unknown {
 export function createRouter(deps: RouterDeps) {
   const os = implement(appContract).$context<{ actor: Actor | null; signal?: AbortSignal }>();
   const repos = createRepos(deps.prisma);
+  // Tracks loginIds that belong to Sage OAuth sessions so handlers can dispatch correctly.
+  const sageLoginIds = new Set<string>();
   const onboardingDeps = { prisma: deps.prisma, events: deps.events, connectors: deps.connectors };
   const mcpOAuth = deps.mcpOAuth ?? new McpOAuthBroker(deps.prisma, deps.secrets);
   const groupRepos = createGroupRepos(deps.prisma);
@@ -692,14 +703,29 @@ export function createRouter(deps: RouterDeps) {
       ]);
       const { bots, groups, botSections } = navigation.current;
       const active = bots.find((bot) => bot.id === input.botId) ?? bots[0];
-      const [thread, routines] = active
-        ? await Promise.all([
-            resolveThreadTarget(deps.prisma, actor, { botId: active.id }).then((target) =>
+      const [thread, routines, requiresSageAuth] = await Promise.all([
+        active
+          ? resolveThreadTarget(deps.prisma, actor, { botId: active.id }).then((target) =>
               threadSnapshot(deps, target),
-            ),
-            listRoutinesDto(deps, actor, active.id),
-          ])
-        : [null, []];
+            )
+          : Promise.resolve(null),
+        active ? listRoutinesDto(deps, actor, active.id) : Promise.resolve([]),
+        (async () => {
+          const cred = await findModelCredential(deps.prisma, actor, OPENAI_COMPATIBLE_PROVIDER_ID);
+          if (!cred) return false;
+          const row = await deps.prisma.secret.findFirst({
+            where: { id: cred.secretId, userId: actor.userId, spaceId: null },
+            select: { ciphertext: true },
+          });
+          if (!row) return false;
+          try {
+            const secret = parseModelSecret(deps.secrets.load(row.ciphertext, cred.secretId));
+            return secret.kind === "openai_compatible" && secret.apiKey === "sage";
+          } catch {
+            return false;
+          }
+        })(),
+      ]);
       return {
         me,
         bots,
@@ -710,6 +736,7 @@ export function createRouter(deps: RouterDeps) {
         thread,
         routines,
         spaces: navigation.spaces,
+        ...(requiresSageAuth ? { requiresSageAuth } : {}),
       };
     }),
     deployment: {
@@ -770,7 +797,11 @@ export function createRouter(deps: RouterDeps) {
       }),
     },
     models: {
-      list: authed.models.list.handler(async () => [...listPiCatalog(), scriptedCatalogEntry]),
+      list: authed.models.list.handler(async () => [
+        ...listPiCatalog(),
+        scriptedCatalogEntry,
+        ...listSageCatalog(),
+      ]),
       credentials: authed.models.credentials.handler(async ({ context }) => {
         const rows = await deps.prisma.userModelCredential.findMany({
           where: { userId: context.actor.userId },
@@ -869,6 +900,27 @@ export function createRouter(deps: RouterDeps) {
         },
       ),
       beginOAuth: authed.models.beginOAuth.handler(async ({ context, input }) => {
+        const isSage = (SAGE_PROVIDER_IDS as ReadonlyArray<string>).includes(input.provider);
+        if (isSage && input.mode === "pkce") {
+          const begun = await deps.sageOAuthLogins.beginPkce({
+            userId: context.actor.userId,
+            spaceId: context.actor.spaceId,
+            provider: input.provider,
+            redirectUri: new URL("/callback", deps.env.webOrigin).toString(),
+          });
+          sageLoginIds.add(begun.loginId);
+          return begun;
+        }
+        if (isSage) {
+          const begun = await deps.sageOAuthLogins.begin({
+            userId: context.actor.userId,
+            spaceId: context.actor.spaceId,
+            provider: input.provider,
+            signal: context.signal,
+          });
+          sageLoginIds.add(begun.loginId);
+          return begun;
+        }
         return deps.oauthLogins.begin({
           userId: context.actor.userId,
           spaceId: context.actor.spaceId,
@@ -879,9 +931,18 @@ export function createRouter(deps: RouterDeps) {
         });
       }),
       submitOAuthCode: authed.models.submitOAuthCode.handler(async ({ context, input }) => {
+        // Sage uses PKCE: the browser completes the code exchange; no server-side submit needed.
+        if (sageLoginIds.has(input.loginId)) return { ok: true as const };
         return deps.oauthLogins.submit(input.loginId, context.actor, input.code);
       }),
       completeOAuth: authed.models.completeOAuth.handler(async ({ context, input }) => {
+        if (sageLoginIds.has(input.loginId)) {
+          const result = deps.sageOAuthLogins.complete(input.loginId, {
+            userId: context.actor.userId,
+            spaceId: context.actor.spaceId,
+          });
+          return result.status === "connected" ? { status: "ready" as const } : result;
+        }
         const result = await deps.oauthLogins.complete(input.loginId, {
           userId: context.actor.userId,
           spaceId: context.actor.spaceId,
@@ -890,6 +951,37 @@ export function createRouter(deps: RouterDeps) {
       }),
       finishOAuth: authed.models.finishOAuth.handler(async ({ context, input }) => {
         throwIfAborted(context.signal);
+        if (sageLoginIds.has(input.loginId)) {
+          const result = await deps.sageOAuthLogins.finish(
+            input.loginId,
+            context.actor,
+            async (login) => {
+              sageLoginIds.delete(input.loginId);
+              const cred = await persistModelCredential(deps, context.actor, {
+                provider: login.provider,
+                plaintext: JSON.stringify(login.credential),
+                label: SAGE_PROVIDER_NAMES[login.provider] ?? "Sage",
+                signal: context.signal,
+              });
+              // Sync JWT to the openai-compatible credential so the PI runtime
+              // sends it as bearer when calling the broker in sage mode.
+              await syncSageJwtToCompatibleModel(
+                deps,
+                context.actor,
+                login.accessToken,
+                context.signal,
+              ).catch(() => undefined);
+              return cred;
+            },
+          );
+          if (result.status === "pending") {
+            throw new ORPCError("CONFLICT", { message: "Sign-in has not finished yet." });
+          }
+          if (result.status === "error") {
+            throw new ORPCError("NOT_FOUND", { message: result.error });
+          }
+          return result.value;
+        }
         const result = await deps.oauthLogins.finish(
           input.loginId,
           context.actor,
@@ -912,7 +1004,38 @@ export function createRouter(deps: RouterDeps) {
         return result.value;
       }),
       cancelOAuth: authed.models.cancelOAuth.handler(async ({ context, input }) => {
+        if (sageLoginIds.has(input.loginId)) {
+          sageLoginIds.delete(input.loginId);
+          await deps.sageOAuthLogins.cancel(input.loginId, context.actor);
+          return { ok: true as const };
+        }
         await deps.oauthLogins.cancel(input.loginId, context.actor);
+        return { ok: true as const };
+      }),
+      resetSageJwt: authed.models.resetSageJwt.handler(async ({ context }) => {
+        const actor = context.actor;
+        const cred = await findModelCredential(deps.prisma, actor, OPENAI_COMPATIBLE_PROVIDER_ID);
+        if (cred) {
+          const row = await deps.prisma.secret.findFirst({
+            where: { id: cred.secretId, userId: actor.userId, spaceId: null },
+            select: { ciphertext: true },
+          });
+          if (row) {
+            try {
+              const secret = parseModelSecret(deps.secrets.load(row.ciphertext, cred.secretId));
+              if (secret.kind === "openai_compatible" && secret.apiKey !== "sage") {
+                await persistModelCredential(deps, actor, {
+                  provider: OPENAI_COMPATIBLE_PROVIDER_ID,
+                  plaintext: serializeModelSecret({ ...secret, apiKey: "sage" }),
+                  label: cred.label,
+                  signal: context.signal,
+                });
+              }
+            } catch {
+              // Unreadable secret — nothing to reset.
+            }
+          }
+        }
         return { ok: true as const };
       }),
       setDefault: authed.models.setDefault.handler(async ({ context, input }) => {
@@ -1018,7 +1141,7 @@ export function createRouter(deps: RouterDeps) {
           if (!credential) {
             throw new ORPCError("BAD_REQUEST", { message: "Connect that model provider first" });
           }
-          const knownModels = [...listPiCatalog(), scriptedCatalogEntry];
+          const knownModels = [...listPiCatalog(), scriptedCatalogEntry, ...listSageCatalog()];
           const inCatalog = knownModels.some(
             (item) => item.provider === input.modelProvider && item.id === input.modelId,
           );
@@ -5102,6 +5225,35 @@ function computerHostFor(
   if (sandboxProvider !== "docker") return null;
   if (stored === "this-mac" || stored === "docker") return stored;
   return null;
+}
+
+async function syncSageJwtToCompatibleModel(
+  deps: RouterDeps,
+  actor: Actor,
+  jwt: string,
+  signal: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal);
+  const credential = await findModelCredential(deps.prisma, actor, OPENAI_COMPATIBLE_PROVIDER_ID);
+  if (!credential) return;
+  const row = await deps.prisma.secret.findFirst({
+    where: { id: credential.secretId, userId: actor.userId, spaceId: null },
+    select: { ciphertext: true },
+  });
+  if (!row) return;
+  let secret;
+  try {
+    secret = parseModelSecret(deps.secrets.load(row.ciphertext, credential.secretId));
+  } catch {
+    return;
+  }
+  if (secret.kind !== "openai_compatible") return;
+  await persistModelCredential(deps, actor, {
+    provider: OPENAI_COMPATIBLE_PROVIDER_ID,
+    plaintext: serializeModelSecret({ ...secret, apiKey: jwt }),
+    label: credential.label,
+    signal,
+  });
 }
 
 async function persistModelCredential(

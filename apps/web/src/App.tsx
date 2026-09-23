@@ -15,6 +15,7 @@ import {
 import { IntegrationSetupPage } from "./pages/IntegrationSetup";
 import { LocalSettingsPage } from "./pages/LocalSettings";
 import { McpOAuthCallbackPage } from "./pages/McpOAuthCallback";
+import { SageOAuthCallbackPage } from "./pages/SageOAuthCallbackPage";
 import { ShellPage } from "./pages/Shell";
 
 const AuthPage = lazy(() =>
@@ -94,6 +95,7 @@ function SessionApp() {
             path="/onboarding"
             element={user ? <OnboardingPage /> : <Navigate to="/sign-in" replace />}
           />
+          <Route path="/callback" element={<SageOAuthCallbackPage />} />
           <Route
             path="/mcp/oauth/callback"
             element={user ? <McpOAuthCallbackPage /> : <Navigate to="/sign-in" replace />}
