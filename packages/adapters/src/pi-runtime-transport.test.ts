@@ -1,7 +1,14 @@
 import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { DEFAULT_MODEL_MAX_TOKENS } from "@rakazo/contracts";
 import { describe, expect, it } from "vitest";
-import { conversationSessionId, isOpenCodeProvider, reliableStreamOptions, withSwitchboardChatId, withSwitchboardRunCapture } from "./pi-runtime.js";
+import {
+  conversationSessionId,
+  isOpenCodeProvider,
+  reliableStreamOptions,
+  withSwitchboardChatId,
+  withSwitchboardLiveNotices,
+  withSwitchboardRunCapture,
+} from "./pi-runtime.js";
 import { MODEL_STREAM_MAX_RETRIES, MODEL_STREAM_TIMEOUT_MS } from "./pi-runtime-limits.js";
 
 const streamDefaults = {
@@ -118,6 +125,17 @@ describe("Pi runtime transport", () => {
     );
     expect(opencode.headers?.["x-switchboard-chat-id"]).toBeUndefined();
     expect(opencode.headers?.["x-opencode-session"]).toBe("thread-1:bot-1");
+  });
+
+  it("attaches X-Switchboard-Live-Notices only for openai-compatible", () => {
+    const options = { transport: "auto" as const, headers: { "X-Custom": "1" } };
+    const tagged = withSwitchboardLiveNotices({ provider: "openai-compatible" } as Model<Api>, options);
+    expect(tagged.headers).toEqual({
+      "X-Custom": "1",
+      "X-Switchboard-Live-Notices": "1",
+    });
+    const skipped = withSwitchboardLiveNotices({ provider: "anthropic" } as Model<Api>, options);
+    expect(skipped.headers).toEqual({ "X-Custom": "1" });
   });
 
   it("captures switchboard.run_id from an OpenAI-compatible SSE fetch", async () => {

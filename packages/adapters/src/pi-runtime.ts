@@ -259,10 +259,13 @@ export class PiAgentRuntime implements AgentRuntime {
               ctx,
               withSwitchboardRunCapture(
                 m,
-                withSwitchboardChatId(
+                withSwitchboardLiveNotices(
                   m,
-                  reliableStreamOptions(m, options, request.model.maxTokens),
-                  request.threadId,
+                  withSwitchboardChatId(
+                    m,
+                    reliableStreamOptions(m, options, request.model.maxTokens),
+                    request.threadId,
+                  ),
                 ),
                 switchboardSink(request),
               ),
@@ -309,8 +312,6 @@ export class PiAgentRuntime implements AgentRuntime {
         signal.addEventListener("abort", onAbort);
 
         let streamed = "";
-        let bannerParsed = false;
-        let bannerBuffer = "";
         let toolCalls = 0;
         let toolActivityShowing = false;
         let silentToolContinuations = 0;
@@ -337,24 +338,7 @@ export class PiAgentRuntime implements AgentRuntime {
           ) {
             const rawDelta = event.assistantMessageEvent.delta;
             if (rawDelta) {
-              // Strip [switchboard] routing notice banner from the leading text of each
-              // assistant message. The broker prepends these diagnostic lines followed
-              // by a blank line; buffer deltas until we see "\n\n", then decide.
-              let delta: string | undefined = rawDelta;
-              if (!bannerParsed) {
-                bannerBuffer += rawDelta;
-                const sep = bannerBuffer.indexOf("\n\n");
-                if (sep === -1) {
-                  delta = undefined; // Still accumulating banner header; nothing to emit yet
-                } else {
-                  bannerParsed = true;
-                  const stripped = bannerBuffer.trimStart().startsWith("[switchboard]")
-                    ? bannerBuffer.slice(sep + 2) // drop banner lines + blank line
-                    : bannerBuffer;               // no banner; emit everything buffered
-                  bannerBuffer = "";
-                  delta = stripped || undefined;
-                }
-              }
+              const delta = rawDelta;
               if (delta) {
                 if (toolActivityShowing) {
                   // Real text replaces the activity line instead of appending to it.
@@ -397,9 +381,6 @@ export class PiAgentRuntime implements AgentRuntime {
             }
           }
           if (event.type === "message_end" && event.message.role === "assistant") {
-            // Reset banner state so the next assistant turn gets stripped independently.
-            bannerParsed = false;
-            bannerBuffer = "";
             const text = assistantText(event.message);
             if (text && !streamed) {
               streamed = text;
@@ -972,16 +953,23 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
           }
           if (tool.name === "run_subagent") {
             const brokerMcpUrl = process.env.RAKAZO_BROKER_HELPER_MCP_URL;
-            const brokerMcpKey = process.env.RAKAZO_BROKER_MCP_KEY;
             const brokerMcpTool = process.env.RAKAZO_BROKER_HELPER_MCP_TOOL;
+            // In sage mode the apiKey is a JWT. Forward it as the MCP bearer so the
+            // broker can stamp it on the StepContext and use SageCompleter for helper
+            // subagent calls. Fall back to the static RAKAZO_BROKER_MCP_KEY otherwise.
+            const isJwt = (key: string | undefined): boolean =>
+              !!key && key.split(".").length === 3;
+            const effectiveMcpKey = isJwt(host.apiKey)
+              ? host.apiKey
+              : process.env.RAKAZO_BROKER_MCP_KEY;
             const result =
-              brokerMcpUrl && brokerMcpKey && brokerMcpTool
+              brokerMcpUrl && effectiveMcpKey && brokerMcpTool
                 ? await callBrokerSubagent(
                     host,
                     executionId,
                     args,
                     brokerMcpUrl,
-                    brokerMcpKey,
+                    effectiveMcpKey,
                     brokerMcpTool,
                     {
                       botId: host.request.botId,
@@ -1104,10 +1092,13 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
         ctx,
         withSwitchboardRunCapture(
           m,
-          withSwitchboardChatId(
+          withSwitchboardLiveNotices(
             m,
-            reliableStreamOptions(m, options, requestModel.maxTokens),
-            host.request.threadId,
+            withSwitchboardChatId(
+              m,
+              reliableStreamOptions(m, options, requestModel.maxTokens),
+              host.request.threadId,
+            ),
           ),
           switchboardSink(host.request),
         ),
@@ -1674,6 +1665,27 @@ export function withSwitchboardChatId(
   return {
     ...options,
     headers: { ...options.headers, "x-switchboard-chat-id": id },
+  };
+}
+
+/**
+ * Opts every openai-compatible chat request into the Broker's early-open live
+ * notice stream (tech-plan-workflow-helper-concurrency Phase 6a). Sent
+ * unconditionally on every such request, not just ones that end up spawning a
+ * helper batch -- the Broker itself decides eligibility from the roster and the
+ * request shape, so there is nothing for the fork to predict here. Absence of
+ * this header is always the Broker's safe, buffered default; a non-openai-
+ * compatible provider (or Windmill, which never sends this header at all) is
+ * unaffected either way.
+ */
+export function withSwitchboardLiveNotices(
+  model: Pick<Model<Api>, "provider">,
+  options: SimpleStreamOptions,
+): SimpleStreamOptions {
+  if (model.provider !== OPENAI_COMPATIBLE_PROVIDER_ID) return options;
+  return {
+    ...options,
+    headers: { ...options.headers, "X-Switchboard-Live-Notices": "1" },
   };
 }
 
